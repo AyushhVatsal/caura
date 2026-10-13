@@ -46,6 +46,7 @@ from common.embedding import (
 )
 from common.events import publish_memory_embed_request, publish_memory_enrich_request
 from common.governance import mask, scan
+from common.usage import scoped
 from core_api.constants import (
     ANN_POOL_SHADOW,
     ANN_POOL_SIZE,
@@ -863,6 +864,12 @@ def _memory_to_out(
     )
 
 
+@scoped(
+    "write",
+    tenant=lambda a: a["data"].tenant_id,
+    agent=lambda a: a["data"].agent_id,
+    fleet=lambda a: a["data"].fleet_id,
+)
 async def create_memory(data: MemoryCreate, *, is_inferred: bool = False) -> MemoryOut:
     """Create one memory.
 
@@ -896,7 +903,12 @@ async def create_memory(data: MemoryCreate, *, is_inferred: bool = False) -> Mem
     # needs its own call and its own route-level test.
     if data.metadata:
         data.metadata = sanitize_caller_metadata(data.metadata)
-    return await _run_write_pipeline(data, is_inferred=is_inferred)
+    out = await _run_write_pipeline(data, is_inferred=is_inferred)
+    # Value metering: where this memory came from (its session's work), once.
+    from core_api.services.value_ledger import schedule_origin
+
+    schedule_origin(out, origin=data.origin.model_dump() if getattr(data, "origin", None) else None)
+    return out
 
 
 def _memory_out_with_created_links(ctx, memory: dict) -> MemoryOut:
@@ -1532,6 +1544,12 @@ async def _handle_auto_chunk_from_ctx(data: MemoryCreate, ctx: object) -> Memory
     return _memory_out_with_created_links(ctx, memory)
 
 
+@scoped(
+    "write",
+    tenant=lambda a: a["data"].tenant_id,
+    agent=lambda a: a["data"].agent_id,
+    fleet=lambda a: a["data"].fleet_id,
+)
 async def create_memories_bulk(
     data: BulkMemoryCreate,
     *,
@@ -2631,6 +2649,11 @@ async def create_memories_bulk(
     final_results = cast("list[BulkItemResult]", results)
 
     bulk_ms = round((time.perf_counter() - t0) * 1000)
+    # Value metering: where each newly created memory came from. The broker
+    # writes through here, stamping its session on every item's metadata.
+    from core_api.services.value_ledger import schedule_bulk_origins
+
+    schedule_bulk_origins(data, final_results)
     return BulkMemoryResponse(
         created=created_count,
         duplicates=dup_count,
@@ -2955,6 +2978,7 @@ async def _record_stranded(
     )
 
 
+@scoped("reembed", tenant="tenant_id")
 async def _reembed_memory(
     memory_id: UUID,
     content: str,
@@ -3117,6 +3141,7 @@ async def _reembed_memory(
     )
 
 
+@scoped("reembed", tenant="tenant_id", fleet="fleet_id")
 async def _reembed_memories_bulk(
     items: list[tuple[UUID, str]],
     tenant_id: str,
@@ -3831,6 +3856,7 @@ def _merged_metadata(stored: dict, metadata_patch: dict) -> dict:
     return merged
 
 
+@scoped("enrichment", tenant="tenant_id", agent="agent_id", fleet="fleet_id")
 async def _enrich_memory_background(
     memory_id: UUID,
     content: str,
@@ -4399,6 +4425,7 @@ _EDIT_PINNED_ENRICHMENT_FIELDS: frozenset[str] = frozenset({"memory_type", "weig
 _EDIT_KEPT_IF_SET_FIELDS: frozenset[str] = frozenset({"title", "ts_valid_start", "ts_valid_end"})
 
 
+@scoped("update", tenant="tenant_id", agent="agent_id")
 async def update_memory(
     memory_id: UUID,
     tenant_id: str,
@@ -5780,6 +5807,7 @@ def _extract_temporal_date_range(
     return None
 
 
+@scoped(None, tenant="tenant_id", agent="caller_agent_id")
 async def search_memories(
     tenant_id: str,
     query: str,
@@ -5886,6 +5914,11 @@ async def search_memories(
     )
     if recall_ctx is not None:
         recall_ctx["recall_tracked"] = bool(legacy_results) and allow_recall_bump
+    # The pipeline records this in RecordRecallValue; wired here too so the
+    # hotfix lever does not silently stop the savings figures.
+    from core_api.pipeline.steps.search.record_recall_value import schedule_recall_value
+
+    schedule_recall_value(legacy_results, tenant_id=tenant_id, caller_agent_id=caller_agent_id, source=source)
     return legacy_results
 
 

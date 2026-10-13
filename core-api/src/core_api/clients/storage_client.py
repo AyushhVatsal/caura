@@ -18,6 +18,7 @@ from common.events.lifecycle_purge_request import MEMORY_RETENTION_MAX_DAYS
 from common.http_retry import CONNECT_PHASE_MAX_ATTEMPTS, with_connect_phase_retry, with_retry
 from common.settings_version import SETTINGS_CHANGED
 from common.storage_auth import is_storage_shared_secret_rejection
+from common.usage import per_tenant
 from core_api.clients.identity_token import evict as _evict_id_token
 from core_api.clients.identity_token import fetch_auth_header
 from core_api.config import settings
@@ -1719,6 +1720,32 @@ class CoreStorageClient:
             raise RuntimeError("core-storage-api /memories/list returned 404")
         return result  # type: ignore[return-value]
 
+    async def memory_field_signature(self, data: dict) -> dict:
+        """``{count, embedded, newest}`` over the rows the memory field would
+        place — the field layout cache's change-detector.
+
+        ``data`` carries ``{tenant_id, caller_agent_id?, caller_tenant_id?,
+        fleet_id?, include_scope_agent?}``, the visibility arguments of
+        ``list_memories_by_filters``.
+        """
+        result = await self._post("/memories/field-signature", data, read=True)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/field-signature returned 404")
+        return result  # type: ignore[return-value]
+
+    async def memory_field_page(self, data: dict) -> dict:
+        """One keyset page of compact rows WITH embeddings for the field layout.
+
+        ``data`` is the ``memory_field_signature`` body plus ``limit`` (<= 2000)
+        and ``cursor_ts``/``cursor_id`` from the previous page's
+        ``next_cursor``. Returns ``{rows, entities, next_cursor}``; each row's
+        embedding is ``embedding_b64`` (base64 little-endian float32) or null.
+        """
+        result = await self._post("/memories/field-page", data, read=True)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/field-page returned 404")
+        return result  # type: ignore[return-value]
+
     async def memory_stats_breakdown(self, data: dict) -> dict:
         """Visibility-scoped stats breakdown (MCP ``caura_stats``).
 
@@ -1820,6 +1847,64 @@ class CoreStorageClient:
         """
         result = await self._post("/capability-usage", {"rows": rows})
         return result.get("inserted", 0)  # type: ignore[union-attr]
+
+    async def flush_usage(self, batch: dict) -> dict:
+        """Send one usage-metering batch (``common.usage.UsageAggregator``), a flush per tenant.
+
+        Storage binds each flush to one tenant (``per_tenant``). Each part is
+        idempotent by its derived ``batch_id`` — storage claims it once
+        (migration 066) — so the batch is safe to retry on any failure, unlike
+        ``increment_tenant_usage``. Returns how many parts were newly applied.
+        """
+        applied = 0
+        for tenant_id, part in per_tenant(batch):
+            result = await self._post(
+                f"/usage/flush?tenant_id={quote(tenant_id, safe='')}", part, idempotent=True
+            )
+            applied += bool((result or {}).get("applied"))  # type: ignore[union-attr]
+        return {"applied": applied}
+
+    async def query_usage(self, tenant_id: str, body: dict) -> dict:
+        """One tenant's usage totals: ``{"model_calls": [...], "savings": [...]}``."""
+        result = await self._post(
+            f"/usage/query?tenant_id={quote(tenant_id, safe='')}", body, read=True, idempotent=True
+        )
+        return result or {}  # type: ignore[return-value]
+
+    async def value_touch_sessions(self, tenant_id: str, rows: list[dict]) -> dict:
+        """Agent sessions seen in one tenant (value metering, migration 067). Additive."""
+        result = await self._post(
+            f"/value/sessions?tenant_id={quote(tenant_id, safe='')}", {"sessions": rows}
+        )
+        return result or {}  # type: ignore[return-value]
+
+    async def value_record_origin(self, tenant_id: str, row: dict) -> dict:
+        """The work behind one memory; recorded once per memory, so safe to retry."""
+        result = await self._post(
+            f"/value/origins?tenant_id={quote(tenant_id, safe='')}", row, idempotent=True
+        )
+        return result or {}  # type: ignore[return-value]
+
+    async def value_record_reuse(self, tenant_id: str, body: dict) -> dict:
+        """First recalls by a session of memories from other sessions; insert-or-ignore, so safe to retry."""
+        result = await self._post(
+            f"/value/reuse?tenant_id={quote(tenant_id, safe='')}", body, idempotent=True
+        )
+        return result or {}  # type: ignore[return-value]
+
+    async def value_record_outcome(self, tenant_id: str, body: dict) -> dict:
+        """A session's reported outcome for memories it reused; the latest wins, so safe to retry."""
+        result = await self._post(
+            f"/value/outcomes?tenant_id={quote(tenant_id, safe='')}", body, idempotent=True
+        )
+        return result or {}  # type: ignore[return-value]
+
+    async def value_query(self, tenant_id: str, body: dict) -> dict:
+        """One tenant's value figures."""
+        result = await self._post(
+            f"/value/query?tenant_id={quote(tenant_id, safe='')}", body, read=True, idempotent=True
+        )
+        return result or {}  # type: ignore[return-value]
 
     async def increment_tenant_usage(self, rows: list[dict]) -> int:
         """ADD to per-tenant, per-period counters in ``tenant_usage_counters``.

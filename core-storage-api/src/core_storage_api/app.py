@@ -68,6 +68,8 @@ from core_storage_api.routers import (
     tenant_suppression_router,
     tenant_usage_router,
     tenants_router,
+    usage_router,
+    value_router,
 )
 
 logger = logging.getLogger(__name__)
@@ -411,6 +413,13 @@ def create_app() -> FastAPI:
     # aggregator POSTs here on its flush interval via the storage_client.
     app.include_router(capability_usage_router, prefix=prefix)
     app.include_router(tenant_usage_router, prefix=prefix)
+    # Usage metering (migration 066): per-minute model-call and savings
+    # totals, flushed by core-api and core-worker. Cross-tenant / RLS-free
+    # like the two above; each row names its tenant.
+    app.include_router(usage_router, prefix=prefix)
+    # Value metering (migration 067): sessions, memory origins and reuse.
+    # Every route is bound to one tenant.
+    app.include_router(value_router, prefix=prefix)
 
     return app
 

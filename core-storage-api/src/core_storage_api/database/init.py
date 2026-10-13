@@ -40,8 +40,12 @@ _CHAIN_SENTINEL_TABLE = "tenant_suppression"
 # 063's checks stay with it. 065 adds ``ix_memories_contradicted_window``,
 # ``ix_memories_expires_at`` and ``ix_memories_valid_end`` (all three valid, as
 # one build can stop between them) and drops ``ix_memories_status_changed_at``,
-# last; both join the probe.
-_HEAD_FINGERPRINT_REVISION = "065"
+# last; both join the probe. 066 creates the usage-metering tables
+# (``llm_usage_minutes``, ``value_usage_minutes``, ``usage_flush_batches``) in
+# one transaction, so the last of them joins the probe. 067 adds the value
+# metering tables (``agent_sessions``, ``memory_origins``, ``memory_reuse``),
+# also in one transaction; the last joins the probe.
+_HEAD_FINGERPRINT_REVISION = "067"
 _HEAD_FINGERPRINT_SQL: str | None = (
     "SELECT (SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
     "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -51,7 +55,11 @@ _HEAD_FINGERPRINT_SQL: str | None = (
     "AND NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' "
     "AND indexname IN ('ix_memories_recall_count', 'ix_memories_status_changed_at')) "
     "AND EXISTS (SELECT 1 FROM information_schema.columns "
-    "WHERE table_schema = 'public' AND table_name = 'background_task_log' AND column_name = 'handled_at')"
+    "WHERE table_schema = 'public' AND table_name = 'background_task_log' AND column_name = 'handled_at') "
+    "AND EXISTS (SELECT 1 FROM information_schema.tables "
+    "WHERE table_schema = 'public' AND table_name = 'usage_flush_batches') "
+    "AND EXISTS (SELECT 1 FROM information_schema.tables "
+    "WHERE table_schema = 'public' AND table_name = 'memory_reuse')"
 )
 
 _engine: AsyncEngine | None = None

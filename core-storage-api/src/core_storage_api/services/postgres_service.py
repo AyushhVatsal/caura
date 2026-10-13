@@ -11,12 +11,15 @@ shared engine from ``core_storage_api.database.init.get_engine``.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import struct
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 from uuid import UUID
@@ -123,6 +126,8 @@ from common.models.memory import (
 from common.models.organization_settings import OrganizationSettings, OrganizationSettingsAudit
 from common.models.recall_log import RecallCandidate, RecallEvent
 from common.models.tenant_usage_counter import TenantUsageCounter
+from common.models.usage_minutes import LlmUsageMinute, UsageFlushBatch, ValueUsageMinute
+from common.models.value_metering import AgentSession, MemoryOrigin, MemoryReuse
 from common.organization_settings_merge import diff_settings, merge_settings_update
 from common.settings_version import SETTINGS_VERSION_KEY, version_of
 from core_storage_api.observability import PhaseTimer, db_measure
@@ -501,6 +506,23 @@ def _visibility_scope_clause(
         Memory.visibility == "scope_team",
         and_(*own_rows),
     )
+
+
+def _encode_embedding_f32(embedding: Any) -> str | None:
+    """A pgvector value as base64 little-endian float32, or None.
+
+    Used by the field page read, which ships thousands of 1024-dim vectors per
+    page; base64 float32 is about a quarter of the JSON-float encoding. Works
+    whether pgvector hands back a numpy array or a plain sequence.
+    """
+    if embedding is None:
+        return None
+    if hasattr(embedding, "astype"):
+        raw = embedding.astype("<f4").tobytes()
+    else:
+        values = [float(x) for x in embedding]
+        raw = struct.pack(f"<{len(values)}f", *values)
+    return base64.b64encode(raw).decode("ascii")
 
 
 def _utc_day(column: Any) -> ColumnElement[Any]:
@@ -1369,6 +1391,21 @@ _ADMIN_LIST_SORTABLE = frozenset(
 # ``memories`` / ``entities``. ``relations`` and ``fleet_commands`` are
 # listed explicitly (ahead of their parents) so their per-table counts are
 # reported rather than hidden inside a cascade.
+#: Every column ``value_record_origin`` writes, named so no caller key decides one.
+_MEMORY_ORIGIN_COLUMNS: tuple[str, ...] = (
+    "memory_id",
+    "tenant_id",
+    "session_id",
+    "agent_id",
+    "written_at",
+    "origin_seconds",
+    "origin_calls",
+    "origin_tokens_in",
+    "origin_tokens_out",
+    "origin_turns",
+    "origin_source",
+)
+
 _PURGE_TENANT_TABLES: tuple[str, ...] = (
     "relations",
     "fleet_commands",
@@ -1383,6 +1420,10 @@ _PURGE_TENANT_TABLES: tuple[str, ...] = (
     # prevent. Added by migration 036, after H-09 swept for exactly this.
     "memory_conflicts",
     "memory_derivations",
+    # Value metering (migration 067): their own tenant_id, so listed ahead of
+    # ``memories`` rather than left to its cascade, and reported by the purge.
+    "memory_origins",
+    "memory_reuse",
     "memories",
     "entities",
     "agents",
@@ -1425,6 +1466,13 @@ _PURGE_TENANT_TABLES: tuple[str, ...] = (
     "forge_rejected_fingerprints",
     "capability_usage",
     "tenant_usage_counters",
+    # Usage metering (migration 066): counts only, but keyed by the tenant and
+    # its agents, so they go with it.
+    "llm_usage_minutes",
+    "value_usage_minutes",
+    # Value metering (migration 067); ``memory_origins`` and ``memory_reuse``
+    # are listed ahead of ``memories`` above.
+    "agent_sessions",
 )
 
 # Tenant-scoped and deliberately NOT purged, recorded here so their absence
@@ -1497,6 +1545,9 @@ _PURGE_FLEET_TABLES: tuple[str, ...] = (
     "session_traces",
     "agent_activity_digests",
     "forge_rejected_fingerprints",
+    # Usage metering (migration 066) carries ``fleet_id`` too.
+    "llm_usage_minutes",
+    "value_usage_minutes",
 )
 
 
@@ -6535,6 +6586,539 @@ class PostgresService:
                 )
         return len(rows)
 
+    # ── Usage metering (migration 066) ──────────────────────────────────────
+
+    #: Flush ids older than this are pruned; a writer re-sends a lost batch
+    #: within seconds, so a day of history is far more than dedupe needs.
+    USAGE_BATCH_RETENTION_HOURS = 24
+
+    async def usage_flush(
+        self, tenant_id: str, batch_id: UUID, llm_rows: list[dict], value_rows: list[dict]
+    ) -> bool:
+        """Add one tenant's flush of per-minute totals, ONCE. Returns False for a re-sent batch.
+
+        Every row is written under ``tenant_id``: the rows carry no tenant of
+        their own, so a flush cannot reach another tenant's totals.
+
+        One transaction: the batch id is claimed first, and the totals are
+        added only when the claim is new, so a writer that re-sends a batch
+        whose reply it lost is counted once. Additive upserts on the minute
+        keys, so several instances flushing the same minute all land.
+
+        A tenant whose settings say ``observability.usage_metering_enabled:
+        false`` is skipped here, in one place for every writer — core-worker
+        holds no settings of its own. ``organization_settings`` is keyed by the
+        tenant id, as ``resolve_config`` reads it.
+        """
+        async with get_session() as session:
+            off = await session.execute(
+                select(OrganizationSettings.org_id).where(
+                    OrganizationSettings.org_id == tenant_id,
+                    OrganizationSettings.settings["observability"]["usage_metering_enabled"]
+                    .as_boolean()
+                    .is_(False),
+                )
+            )
+            if off.scalar_one_or_none() is not None:
+                llm_rows, value_rows = [], []
+            claimed = await session.execute(
+                pg_insert(UsageFlushBatch)
+                .values(batch_id=batch_id)
+                .on_conflict_do_nothing(index_elements=[UsageFlushBatch.batch_id])
+                .returning(UsageFlushBatch.batch_id)
+            )
+            if claimed.scalar_one_or_none() is None:
+                return False
+            # Every column named, none taken from the caller's keys: the row
+            # dimensions are inserted, and only the counts are ever updated.
+            for r in llm_rows:
+                llm = pg_insert(LlmUsageMinute).values(
+                    minute=r["minute"],
+                    tenant_id=tenant_id,
+                    agent_id=r["agent_id"],
+                    fleet_id=r["fleet_id"],
+                    operation=r["operation"],
+                    kind=r["kind"],
+                    provider=r["provider"],
+                    model=r["model"],
+                    calls=r["calls"],
+                    failures=r["failures"],
+                    tokens_in=r["tokens_in"],
+                    tokens_out=r["tokens_out"],
+                    tokens_reasoning=r["tokens_reasoning"],
+                )
+                await session.execute(
+                    llm.on_conflict_do_update(
+                        index_elements=[
+                            LlmUsageMinute.minute,
+                            LlmUsageMinute.tenant_id,
+                            LlmUsageMinute.agent_id,
+                            LlmUsageMinute.fleet_id,
+                            LlmUsageMinute.operation,
+                            LlmUsageMinute.kind,
+                            LlmUsageMinute.provider,
+                            LlmUsageMinute.model,
+                        ],
+                        set_={
+                            "calls": LlmUsageMinute.calls + llm.excluded.calls,
+                            "failures": LlmUsageMinute.failures + llm.excluded.failures,
+                            "tokens_in": LlmUsageMinute.tokens_in + llm.excluded.tokens_in,
+                            "tokens_out": LlmUsageMinute.tokens_out + llm.excluded.tokens_out,
+                            "tokens_reasoning": LlmUsageMinute.tokens_reasoning
+                            + llm.excluded.tokens_reasoning,
+                        },
+                    )
+                )
+            for r in value_rows:
+                val = pg_insert(ValueUsageMinute).values(
+                    minute=r["minute"],
+                    tenant_id=tenant_id,
+                    agent_id=r["agent_id"],
+                    fleet_id=r["fleet_id"],
+                    operation=r["operation"],
+                    metric=r["metric"],
+                    quantity=r["quantity"],
+                )
+                await session.execute(
+                    val.on_conflict_do_update(
+                        index_elements=[
+                            ValueUsageMinute.minute,
+                            ValueUsageMinute.tenant_id,
+                            ValueUsageMinute.agent_id,
+                            ValueUsageMinute.fleet_id,
+                            ValueUsageMinute.operation,
+                            ValueUsageMinute.metric,
+                        ],
+                        set_={"quantity": ValueUsageMinute.quantity + val.excluded.quantity},
+                    )
+                )
+            await session.execute(
+                delete(UsageFlushBatch).where(
+                    UsageFlushBatch.received_at
+                    < func.now() - text(f"interval '{self.USAGE_BATCH_RETENTION_HOURS} hours'")
+                )
+            )
+        return True
+
+    async def usage_query(
+        self,
+        tenant_id: str,
+        *,
+        start: datetime,
+        end: datetime,
+        group_by: list[str],
+    ) -> dict:
+        """One tenant's totals in ``[start, end)``, grouped by the given dimensions.
+
+        ``group_by`` takes ``day`` and any of the row dimensions; the model
+        totals ignore ``metric`` and the savings totals ignore the model-only
+        dimensions (``kind``, ``provider``, ``model``).
+        """
+
+        def dims(model: Any, allowed: tuple[str, ...]) -> list[Any]:
+            out = []
+            for name in group_by:
+                if name == "day":
+                    out.append(func.date_trunc("day", model.minute).label("day"))
+                elif name in allowed:
+                    out.append(getattr(model, name).label(name))
+            return out
+
+        def rows(result: Any) -> list[dict]:
+            out = []
+            for row in result.mappings():
+                d = dict(row)
+                if isinstance(d.get("day"), datetime):
+                    d["day"] = d["day"].date().isoformat()
+                out.append({k: (int(v) if isinstance(v, Decimal) else v) for k, v in d.items()})
+            return out
+
+        llm_dims = dims(LlmUsageMinute, ("agent_id", "fleet_id", "operation", "kind", "provider", "model"))
+        value_dims = dims(ValueUsageMinute, ("agent_id", "fleet_id", "operation", "metric"))
+        # A report over minutes already flushed: the replica is fine (L-190).
+        async with get_read_session() as session:
+            llm = await session.execute(
+                select(
+                    *llm_dims,
+                    *[
+                        func.coalesce(func.sum(getattr(LlmUsageMinute, c)), 0).label(c)
+                        for c in ("calls", "failures", "tokens_in", "tokens_out", "tokens_reasoning")
+                    ],
+                )
+                .where(
+                    LlmUsageMinute.tenant_id == tenant_id,
+                    LlmUsageMinute.minute >= start,
+                    LlmUsageMinute.minute < end,
+                )
+                .group_by(*llm_dims)
+                # An ungrouped SUM over no rows is one row of zeros; say "nothing" instead.
+                .having(func.count() > 0)
+            )
+            # Savings are always broken out by metric: summing different measures is meaningless.
+            metric_dims = (
+                value_dims
+                if any(d.key == "metric" for d in value_dims)
+                else [*value_dims, ValueUsageMinute.metric.label("metric")]
+            )
+            value = await session.execute(
+                select(*metric_dims, func.coalesce(func.sum(ValueUsageMinute.quantity), 0).label("quantity"))
+                .where(
+                    ValueUsageMinute.tenant_id == tenant_id,
+                    ValueUsageMinute.minute >= start,
+                    ValueUsageMinute.minute < end,
+                )
+                .group_by(*metric_dims)
+            )
+            return {"model_calls": rows(llm), "savings": rows(value)}
+
+    # ── Value metering (migration 067) ──────────────────────────────────────
+
+    async def value_touch_sessions(self, tenant_id: str, rows: list[dict]) -> int:
+        """Record agent sessions seen in one tenant: first and last seen, calls added.
+
+        Additive and order-free, so several core-api instances touching one
+        session all land: the earliest first sighting and the latest last one
+        win, calls add, and an agent or source already known is kept.
+        """
+        if not rows:
+            return 0
+        async with get_session() as session:
+            for r in rows:
+                stmt = pg_insert(AgentSession).values(
+                    tenant_id=tenant_id,
+                    session_id=r["session_id"],
+                    agent_id=r.get("agent_id") or "",
+                    source=r.get("source") or "",
+                    first_seen=r["first_seen"],
+                    last_seen=r["last_seen"],
+                    calls=r.get("calls", 0),
+                )
+                await session.execute(
+                    stmt.on_conflict_do_update(
+                        index_elements=[AgentSession.tenant_id, AgentSession.session_id],
+                        set_={
+                            "first_seen": func.least(AgentSession.first_seen, stmt.excluded.first_seen),
+                            "last_seen": func.greatest(AgentSession.last_seen, stmt.excluded.last_seen),
+                            "calls": AgentSession.calls + stmt.excluded.calls,
+                            "agent_id": func.coalesce(
+                                func.nullif(AgentSession.agent_id, ""), stmt.excluded.agent_id
+                            ),
+                            "source": func.coalesce(
+                                func.nullif(AgentSession.source, ""), stmt.excluded.source
+                            ),
+                        },
+                    )
+                )
+        return len(rows)
+
+    async def value_record_origin(self, tenant_id: str, row: dict) -> dict | None:
+        """Record the work behind one memory, once. Returns what was stored, or None if it already was.
+
+        ``origin_seconds`` runs from the later of the session's first sighting
+        and its previous recorded write to this one; with neither known it is
+        NULL rather than a guess. Reported tokens and turns are stored as sent.
+        """
+        written_at = row["written_at"]
+        async with get_session() as session:
+            # The session is known from this write at the latest.
+            await session.execute(
+                pg_insert(AgentSession)
+                .values(
+                    tenant_id=tenant_id,
+                    session_id=row["session_id"],
+                    agent_id=row.get("agent_id") or "",
+                    source=row.get("session_source") or "",
+                    first_seen=written_at,
+                    last_seen=written_at,
+                    calls=0,
+                )
+                .on_conflict_do_nothing(index_elements=[AgentSession.tenant_id, AgentSession.session_id])
+            )
+            started = await session.scalar(
+                select(AgentSession.first_seen).where(
+                    AgentSession.tenant_id == tenant_id, AgentSession.session_id == row["session_id"]
+                )
+            )
+            previous = await session.scalar(
+                select(func.max(MemoryOrigin.written_at)).where(
+                    MemoryOrigin.tenant_id == tenant_id,
+                    MemoryOrigin.session_id == row["session_id"],
+                    MemoryOrigin.written_at < written_at,
+                )
+            )
+            since = max(t for t in (started, previous) if t is not None) if (started or previous) else None
+            seconds = max(0, int((written_at - since).total_seconds())) if since is not None else None
+            values = {
+                "memory_id": row["memory_id"],
+                "tenant_id": tenant_id,
+                "session_id": row["session_id"],
+                "agent_id": row.get("agent_id") or "",
+                "written_at": written_at,
+                "origin_seconds": seconds,
+                "origin_calls": row.get("origin_calls"),
+                "origin_tokens_in": row.get("origin_tokens_in"),
+                "origin_tokens_out": row.get("origin_tokens_out"),
+                "origin_turns": row.get("origin_turns"),
+                "origin_source": row.get("origin_source"),
+            }
+            inserted = await session.scalar(
+                pg_insert(MemoryOrigin)
+                .values(**{k: values[k] for k in _MEMORY_ORIGIN_COLUMNS})
+                .on_conflict_do_nothing(index_elements=[MemoryOrigin.memory_id])
+                .returning(MemoryOrigin.memory_id)
+            )
+        return values if inserted is not None else None
+
+    async def value_record_reuse(
+        self,
+        tenant_id: str,
+        *,
+        session_id: str,
+        reader_agent_id: str,
+        memory_ids: list[str],
+        recalled_at: datetime,
+    ) -> int:
+        """Record the first time this session recalls each memory written in another session.
+
+        The writer's session is the memory's recorded origin, else the
+        broker's ``metadata.session_id``; a memory written by this same
+        session is not a reuse. Insert-or-ignore on (tenant, session, memory)
+        is the "once per session" rule. Returns the reuses newly recorded.
+        """
+        ids = [UUID(m) for m in dict.fromkeys(memory_ids)]
+        if not ids:
+            return 0
+        async with get_session() as session:
+            found = await session.execute(
+                select(
+                    Memory.id,
+                    Memory.agent_id,
+                    func.coalesce(MemoryOrigin.session_id, Memory.metadata_["session_id"].astext, "").label(
+                        "writer_session"
+                    ),
+                )
+                .outerjoin(MemoryOrigin, MemoryOrigin.memory_id == Memory.id)
+                .where(Memory.tenant_id == tenant_id, Memory.id.in_(ids))
+            )
+            rows = [
+                {
+                    "tenant_id": tenant_id,
+                    "session_id": session_id,
+                    "memory_id": mid,
+                    "reader_agent_id": reader_agent_id or "",
+                    "writer_agent_id": agent or "",
+                    "writer_session_id": writer_session or "",
+                    "first_recalled_at": recalled_at,
+                }
+                for mid, agent, writer_session in found.all()
+                if writer_session != session_id
+            ]
+            if not rows:
+                return 0
+            inserted = await session.execute(
+                pg_insert(MemoryReuse)
+                .values(rows)
+                .on_conflict_do_nothing(
+                    index_elements=[MemoryReuse.tenant_id, MemoryReuse.session_id, MemoryReuse.memory_id]
+                )
+                .returning(MemoryReuse.memory_id)
+            )
+            return len(inserted.all())
+
+    async def value_record_outcome(
+        self, tenant_id: str, *, session_id: str, memory_ids: list[str], outcome: str
+    ) -> int:
+        """Mark this session's reuse of the named memories with what it reported.
+
+        Only reuse rows the session has: a memory it never recalled from
+        another session cannot be confirmed by naming it. The latest report
+        wins. Returns the rows marked.
+        """
+        ids = [UUID(m) for m in dict.fromkeys(memory_ids)]
+        if not ids:
+            return 0
+        async with get_session() as session:
+            marked = await session.execute(
+                sql_update(MemoryReuse)
+                .where(
+                    MemoryReuse.tenant_id == tenant_id,
+                    MemoryReuse.session_id == session_id,
+                    MemoryReuse.memory_id.in_(ids),
+                )
+                .values(outcome=outcome, outcome_at=func.now())
+                .returning(MemoryReuse.memory_id)
+            )
+            return len(marked.all())
+
+    async def value_query(self, tenant_id: str, *, start: datetime, end: datetime, top: int = 8) -> dict:
+        """One tenant's value figures in ``[start, end)``."""
+        in_window = (MemoryReuse.first_recalled_at >= start, MemoryReuse.first_recalled_at < end)
+        reuse = (
+            select(
+                MemoryReuse.session_id,
+                MemoryReuse.memory_id,
+                MemoryReuse.reader_agent_id,
+                MemoryReuse.writer_agent_id,
+                MemoryReuse.first_recalled_at,
+                MemoryOrigin.origin_seconds,
+                MemoryOrigin.origin_calls,
+                MemoryOrigin.origin_tokens_in,
+                MemoryOrigin.origin_tokens_out,
+                MemoryOrigin.origin_turns,
+                MemoryOrigin.memory_id.is_not(None).label("origin_recorded"),
+                MemoryReuse.outcome,
+            )
+            .outerjoin(MemoryOrigin, MemoryOrigin.memory_id == MemoryReuse.memory_id)
+            .where(MemoryReuse.tenant_id == tenant_id, *in_window)
+            .subquery()
+        )
+        cross = (
+            (reuse.c.reader_agent_id != "")
+            & (reuse.c.writer_agent_id != "")
+            & (reuse.c.reader_agent_id != reuse.c.writer_agent_id)
+        )
+        async with get_read_session() as session:
+            totals = (
+                (
+                    await session.execute(
+                        select(
+                            func.count().label("reuses"),
+                            # Helped = recalled a memory whose origin was recorded, so
+                            # the work behind it is known. Recalls of memories older
+                            # than value metering count as reuse, not as help.
+                            func.count(func.distinct(reuse.c.session_id))
+                            .filter(reuse.c.origin_recorded)
+                            .label("sessions_helped"),
+                            func.count().filter(reuse.c.origin_recorded).label("reuses_with_origin"),
+                            func.count(func.distinct(reuse.c.memory_id)).label("memories_reused"),
+                            func.coalesce(func.sum(reuse.c.origin_seconds), 0).label("origin_seconds"),
+                            func.count(reuse.c.origin_seconds).label("reuses_with_time"),
+                            func.coalesce(func.sum(reuse.c.origin_calls), 0).label("origin_calls"),
+                            func.coalesce(func.sum(reuse.c.origin_tokens_in), 0).label("origin_tokens_in"),
+                            func.coalesce(func.sum(reuse.c.origin_tokens_out), 0).label("origin_tokens_out"),
+                            func.count(reuse.c.origin_tokens_in).label("reuses_with_tokens"),
+                            func.coalesce(func.sum(reuse.c.origin_turns), 0).label("origin_turns"),
+                            func.count().filter(cross).label("cross_agent_reuses"),
+                            # Confirmed: the session later reported success for work
+                            # that named this memory (Evolve).
+                            func.count().filter(reuse.c.outcome == "success").label("confirmed_reuses"),
+                            func.coalesce(
+                                func.sum(reuse.c.origin_seconds).filter(reuse.c.outcome == "success"), 0
+                            ).label("confirmed_seconds"),
+                            func.coalesce(
+                                func.sum(
+                                    func.coalesce(reuse.c.origin_tokens_in, 0)
+                                    + func.coalesce(reuse.c.origin_tokens_out, 0)
+                                ).filter(reuse.c.outcome == "success"),
+                                0,
+                            ).label("confirmed_tokens"),
+                            func.count().filter(reuse.c.outcome == "failure").label("failed_reuses"),
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            sessions = await session.scalar(
+                select(func.count())
+                .select_from(AgentSession)
+                .where(
+                    AgentSession.tenant_id == tenant_id,
+                    AgentSession.last_seen >= start,
+                    AgentSession.first_seen < end,
+                )
+            )
+            day = func.date_trunc("day", reuse.c.first_recalled_at)
+            daily = (
+                (
+                    await session.execute(
+                        select(
+                            day.label("day"),
+                            func.count().label("reuses"),
+                            func.coalesce(func.sum(reuse.c.origin_seconds), 0).label("origin_seconds"),
+                        )
+                        .group_by(day)
+                        .order_by(day)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+            async def leaders(column: Any) -> list[dict]:
+                rows = (
+                    (
+                        await session.execute(
+                            select(
+                                column.label("agent_id"),
+                                func.count().label("reuses"),
+                                func.coalesce(func.sum(reuse.c.origin_seconds), 0).label("origin_seconds"),
+                            )
+                            .where(column != "", cross)
+                            .group_by(column)
+                            .order_by(func.count().desc())
+                            .limit(top)
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                return [
+                    {k: int(v) if isinstance(v, int | Decimal) else v for k, v in r.items()} for r in rows
+                ]
+
+            teachers = await leaders(reuse.c.writer_agent_id)
+            learners = await leaders(reuse.c.reader_agent_id)
+            # Confirmed only: a person resolved it. Dismissed ones were false
+            # alarms; pending ones are not prevented yet, so they are reported
+            # as waiting rather than counted.
+            decided = func.coalesce(MemoryConflict.resolved_at, MemoryConflict.created_at)
+            conflicts = await session.scalar(
+                select(func.count())
+                .select_from(MemoryConflict)
+                .where(
+                    MemoryConflict.tenant_id == tenant_id,
+                    MemoryConflict.review_status == "resolved",
+                    decided >= start,
+                    decided < end,
+                )
+            )
+            pending = await session.scalar(
+                select(func.count())
+                .select_from(MemoryConflict)
+                .where(MemoryConflict.tenant_id == tenant_id, MemoryConflict.review_status == "pending")
+            )
+            changed = func.coalesce(Memory.status_changed_at, Memory.created_at)
+            superseded = await session.scalar(
+                select(func.count())
+                .select_from(Memory)
+                .where(
+                    Memory.tenant_id == tenant_id,
+                    Memory.status == "outdated",
+                    changed >= start,
+                    changed < end,
+                )
+            )
+        return {
+            "totals": {k: int(v) for k, v in totals.items()},
+            "sessions": int(sessions or 0),
+            "daily": [
+                {
+                    "day": r["day"].date().isoformat(),
+                    "reuses": int(r["reuses"]),
+                    "origin_seconds": int(r["origin_seconds"]),
+                }
+                for r in daily
+            ],
+            "teachers": teachers,
+            "learners": learners,
+            "prevented": {
+                "conflicts_resolved": int(conflicts or 0),
+                "outdated_kept_out": int(superseded or 0),
+                "conflicts_waiting": int(pending or 0),
+            },
+        }
+
     async def tenant_usage_query(
         self,
         tenant_id: str,
@@ -7450,6 +8034,193 @@ class PostgresService:
 
         async with get_read_session() as session:
             return _attach_agent_display_names((await session.execute(stmt)).all())
+
+    # ------------------------------------------------------------------
+    #  Memory field (2D map layout input)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _field_scope_filters(
+        *,
+        tenant_id: str,
+        caller_agent_id: str | None,
+        caller_tenant_id: str | None,
+        fleet_id: str | None,
+        include_scope_agent: bool,
+    ) -> list[ColumnElement[bool]]:
+        """WHERE clauses for the field reads, held to ``memory_list_by_filters``.
+
+        The field is a picture of what ``GET /memories`` lists, so every row it
+        places must be one that route would list to the same caller: the same
+        tenant binding, the same visibility predicate (``scope_agent`` rows only
+        for their author, every scope for a signed-in person via
+        ``include_scope_agent``), the same strict org-blind fleet confinement,
+        and the same exclusions (soft-deleted and held rows). Superseded and
+        archived rows stay in, as they do on the list — the map draws them as
+        ghosts. No cross-tenant widening: the field route pins one tenant.
+        """
+        filters: list[ColumnElement[bool]] = [Memory.tenant_id == tenant_id]
+        if caller_agent_id or not include_scope_agent:
+            filters.append(_visibility_scope_clause(caller_agent_id, caller_tenant_id or tenant_id))
+        if fleet_id:
+            # Same arguments as ``memory_list_by_filters`` — see the comment
+            # there; this is a security confinement (ax-0917-m-19).
+            filters.append(_fleet_scope_clause(Memory, [fleet_id], strict=True, include_org_visibility=False))
+        filters.append(Memory.deleted_at.is_(None))
+        filters.append(Memory.status != QUARANTINED_MEMORY_STATUS)
+        return filters
+
+    async def memory_field_signature(
+        self,
+        *,
+        tenant_id: str,
+        caller_agent_id: str | None = None,
+        caller_tenant_id: str | None = None,
+        fleet_id: str | None = None,
+        include_scope_agent: bool = False,
+    ) -> dict:
+        """Cheap change-detector for the field layout cache.
+
+        Returns ``{count, embedded, newest}``: how many rows the field would
+        place, how many of them carry an embedding, and the newest
+        ``created_at`` / ``status_changed_at`` among them. A write, an
+        embedding landing, a delete or a status flip moves at least one of the
+        three, so core-api can serve a cached layout while all three hold.
+        Recall counters are not tracked here; the cache TTL bounds their age.
+        """
+        filters = self._field_scope_filters(
+            tenant_id=tenant_id,
+            caller_agent_id=caller_agent_id,
+            caller_tenant_id=caller_tenant_id,
+            fleet_id=fleet_id,
+            include_scope_agent=include_scope_agent,
+        )
+        stmt = select(
+            func.count(),
+            func.count().filter(Memory.embedding.isnot(None)),
+            func.max(
+                func.greatest(Memory.created_at, func.coalesce(Memory.status_changed_at, Memory.created_at))
+            ),
+        ).where(*filters)
+        async with get_read_session() as session:
+            count, embedded, newest = (await session.execute(stmt)).one()
+        return {
+            "count": int(count or 0),
+            "embedded": int(embedded or 0),
+            "newest": newest.isoformat() if newest else None,
+        }
+
+    async def memory_field_page(
+        self,
+        *,
+        tenant_id: str,
+        caller_agent_id: str | None = None,
+        caller_tenant_id: str | None = None,
+        fleet_id: str | None = None,
+        include_scope_agent: bool = False,
+        limit: int = 2000,
+        cursor_ts: datetime | None = None,
+        cursor_id: UUID | None = None,
+    ) -> dict:
+        """One keyset page (newest first) of compact rows for the field layout.
+
+        Each row carries the list fields the map draws, a 240-char ``preview``
+        and the full ``content_chars`` (both computed in SQL so full content
+        never crosses the wire), the row's linked ``entity_ids``, and its
+        embedding as base64 little-endian float32 (``embedding_b64``, null when
+        not embedded yet) — a quarter of the JSON-float size. ``entities``
+        carries id/label/type for the entities linked from this page.
+        ``next_cursor`` is ``{ts, id}`` of the last row when a further page may
+        exist, else null.
+        """
+        filters = self._field_scope_filters(
+            tenant_id=tenant_id,
+            caller_agent_id=caller_agent_id,
+            caller_tenant_id=caller_tenant_id,
+            fleet_id=fleet_id,
+            include_scope_agent=include_scope_agent,
+        )
+        if cursor_ts is not None and cursor_id is not None:
+            filters.append(tuple_(Memory.created_at, Memory.id) < tuple_(cursor_ts, cursor_id))  # type: ignore[arg-type]
+        stmt = (
+            select(
+                Memory.id,
+                Memory.agent_id,
+                Memory.fleet_id,
+                Memory.memory_type,
+                Memory.weight,
+                Memory.title,
+                func.substr(Memory.content, 1, 240).label("preview"),
+                func.char_length(Memory.content).label("content_chars"),
+                Memory.created_at,
+                Memory.recall_count,
+                Memory.last_recalled_at,
+                Memory.status,
+                Memory.visibility,
+                Memory.supersedes_id,
+                Memory.embedding,
+            )
+            .where(*filters)
+            .order_by(Memory.created_at.desc(), Memory.id.desc())
+            .limit(limit)
+        )
+        async with get_read_session() as session:
+            rows = (await session.execute(stmt)).all()
+            ids = [r.id for r in rows]
+            links: dict[UUID, list[str]] = defaultdict(list)
+            entities: dict[str, dict] = {}
+            if ids:
+                link_stmt = (
+                    select(
+                        MemoryEntityLink.memory_id,
+                        Entity.id,
+                        Entity.canonical_name,
+                        Entity.entity_type,
+                    )
+                    .join(Entity, Entity.id == MemoryEntityLink.entity_id)
+                    .where(
+                        MemoryEntityLink.memory_id.in_(ids),
+                        # Both ends bound to the tenant: the memory side by
+                        # ``ids`` (from the tenant-bound page above), the
+                        # entity side here — the invariant
+                        # ``_link_within_tenant`` states, spelled as a join
+                        # because its correlated EXISTS cannot sit beside an
+                        # ``Entity`` already in this FROM.
+                        Entity.tenant_id == tenant_id,
+                    )
+                )
+                for mem_id, ent_id, name, etype in (await session.execute(link_stmt)).all():
+                    eid = str(ent_id)
+                    if eid not in links[mem_id]:
+                        links[mem_id].append(eid)
+                    entities.setdefault(eid, {"id": eid, "label": name, "type": etype})
+        out_rows = []
+        for r in rows:
+            out_rows.append(
+                {
+                    "id": str(r.id),
+                    "agent_id": r.agent_id,
+                    "fleet_id": r.fleet_id,
+                    "memory_type": r.memory_type,
+                    "weight": r.weight,
+                    "title": r.title,
+                    "preview": r.preview or "",
+                    "content_chars": int(r.content_chars or 0),
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "recall_count": r.recall_count or 0,
+                    "last_recalled_at": r.last_recalled_at.isoformat() if r.last_recalled_at else None,
+                    "status": r.status,
+                    "visibility": r.visibility,
+                    "supersedes_id": str(r.supersedes_id) if r.supersedes_id else None,
+                    "entity_ids": links.get(r.id, []),
+                    "embedding_b64": _encode_embedding_f32(r.embedding),
+                }
+            )
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_cursor = {"ts": last.created_at.isoformat(), "id": str(last.id)}
+        return {"rows": out_rows, "entities": list(entities.values()), "next_cursor": next_cursor}
 
     async def memory_stats_breakdown(
         self,
