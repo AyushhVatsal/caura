@@ -14,13 +14,13 @@ pgvector>=0.5.1,<1
 alembic>=1.20.0,<2
 pydantic>=2.14.1,<3
 pydantic-settings>=2.16.0,<3
-google-cloud-aiplatform>=2.2.0,<3
+google-cloud-aiplatform>=2.6.0,<3
 # Floor matches core-api/pyproject.toml and core-worker's ``vertex``
 # extra so this local-dev install path resolves the same SDK range the
 # services do. (Not a feature floor: ``HttpOptions(base_url=...)``,
 # which VertexLLMProvider's multi-region handling uses, predates even
 # 1.74.0 — verified by constructing it there.)
-google-genai>=2.31.0
+google-genai>=2.32.0
 # Used directly by core_api.clients.identity_token (Cloud Run ID-token
 # fetch) — explicit here instead of relying on google-cloud-aiplatform's
 # transitive pull, so a future GCP-SDK cleanup can't silently break it.
@@ -65,11 +65,11 @@ structlog>=26.1.0,<27
 # match the service's; tests/test_manual_install_path_runs_the_services.py
 # fails when this file falls behind either service again.
 # Document chunking, imported at startup.
-markdown-it-py>=4.0,<5
-tiktoken>=0.10,<1
+markdown-it-py>=4.2.0,<5
+tiktoken>=0.14.0,<1
 pysbd>=0.3.4,<1
 # The insights discover mode.
-numpy>=2.0,<3
+numpy>=2.5.4,<3
 # FastAPI's UploadFile and Form support.
 python-multipart>=0.0.32,<1
 # SQLAlchemy[asyncio]'s greenlet, capped as the services cap it.
